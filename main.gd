@@ -266,3 +266,10 @@ func _hand_over_to_game() -> void:
 	await get_tree().process_frame
 	_plugin.callXr(destroy_session, session)
 	_plugin.callXr(destroy_instance, instance)
+
+	# The game shares this process: leave it the CPU and memory. Godot's loop would otherwise
+	# spin flat out (vsync is off for XR), and the menu scene would stay in memory.
+	Engine.max_fps = 1
+	OS.low_processor_usage_mode = true
+	for child in get_children():
+		child.queue_free()
