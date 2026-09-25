@@ -15,3 +15,13 @@ export_credentials.cfg
 .mono/
 data_*/
 mono_crash.*.json
+
+# Built by tools/update_amlib.sh
+addons/amlib/bin/
+/build/
+
+# Android build template: keep our changes, not its output or the engine
+# libraries (Godot installs those from its export templates)
+android/build/build/
+android/build/.gradle/
+android/build/libs/
