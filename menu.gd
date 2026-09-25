@@ -5,6 +5,10 @@ extends PanelContainer
 ## mod_catalog.gd, which installs those mods into the instances made here.
 
 const POLL_SECONDS := 0.5
+## When each startup step (see VRMenuPlugin.STARTUP_STEPS) was reached, in ms, per Minecraft version
+const STARTUP_TIMES_PATH := "user://startup_times.json"
+## Until a version has been started once: a 1.21.11 start on a Quest 3S
+const DEFAULT_STARTUP_TIMES := [0, 3000, 17000, 23000, 31000]
 const VERSION_COLUMNS := 3
 
 const BACKGROUND := Color("17131f")
@@ -38,6 +42,19 @@ var _create_button: Button
 var _play_button: Button
 var _progress: ProgressBar
 var _status_label: Label
+var _menu_column: VBoxContainer
+var _launch_screen: PanelContainer
+var _launch_title: Label
+var _launch_bar: ProgressBar
+var _launch_status: Label
+var _launch_detail: Label
+var _launch_version := ""
+## The bar only ever moves forward
+var _launch_value := 0.0
+## From pressing Play until the game takes over the headset (or the launch fails)
+var _launching := false
+## From pressing Create until the instance and its mods are ready
+var _create_screen := false
 ## Instance names in list order, and the one that's selected
 var _names: Array = []
 var _selected := ""
@@ -120,6 +137,7 @@ func _build_ui() -> void:
 	var column := VBoxContainer.new()
 	column.add_theme_constant_override("separation", 20)
 	add_child(column)
+	_menu_column = column
 
 	# Header: logo and title on the left, account on the right
 	var header := HBoxContainer.new()
@@ -259,6 +277,38 @@ func _build_ui() -> void:
 	_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	footer.add_child(_status_label)
 
+	_build_launch_screen()
+
+
+## Covers the whole panel while the game is being prepared and started
+func _build_launch_screen() -> void:
+	_launch_screen = PanelContainer.new()
+	_launch_screen.add_theme_stylebox_override("panel", _box(BACKGROUND, 28, 80))
+	_launch_screen.visible = false
+	add_child(_launch_screen)
+	var column := VBoxContainer.new()
+	column.alignment = BoxContainer.ALIGNMENT_CENTER
+	column.add_theme_constant_override("separation", 28)
+	_launch_screen.add_child(column)
+	var logo := _icon(128)
+	logo.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	column.add_child(logo)
+	_launch_title = _label("", 52)
+	_launch_title.add_theme_font_override("font", _bold)
+	_launch_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	column.add_child(_launch_title)
+	_launch_bar = ProgressBar.new()
+	_launch_bar.custom_minimum_size = Vector2(0, 28)
+	_launch_bar.show_percentage = false
+	column.add_child(_launch_bar)
+	_launch_status = _label("", 30, MUTED)
+	_launch_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_launch_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	column.add_child(_launch_status)
+	_launch_detail = _label("", 26, MUTED.darkened(0.25))
+	_launch_detail.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	column.add_child(_launch_detail)
+
 
 func _label(text: String, size: int, color := TEXT) -> Label:
 	var label := Label.new()
@@ -355,6 +405,7 @@ func _refresh() -> void:
 		_progress.value = state.progress
 		_status_label.text = _message if _message != "" and not state.busy else state.status
 	_status_label.add_theme_color_override("font_color", BAD if _message.begins_with("Couldn't") else MUTED)
+	_update_launch_screen(state)
 	_sign_in_button.disabled = _busy
 	_update_create_button()
 	_update_play_button()
@@ -440,7 +491,41 @@ func _instance_card(instance: Dictionary) -> Button:
 	name_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	texts.add_child(name_label)
 	texts.add_child(_label("Minecraft " + instance.version, 22, MUTED))
+
+	var delete := Button.new()
+	delete.text = "Delete"
+	delete.custom_minimum_size = Vector2(130, 56)
+	delete.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	delete.add_theme_font_size_override("font_size", 22)
+	delete.add_theme_color_override("font_color", MUTED)
+	delete.add_theme_color_override("font_hover_color", BAD)
+	delete.add_theme_stylebox_override("normal", _box(Color(0, 0, 0, 0), 14, 12))
+	delete.add_theme_stylebox_override("hover", _box(Color(BAD, 0.12), 14, 12))
+	delete.add_theme_stylebox_override("pressed", _box(Color(BAD, 0.25), 14, 12))
+	delete.pressed.connect(_on_delete_pressed.bind(delete, instance.name))
+	row.add_child(delete)
 	return card
+
+
+## Deleting takes two presses, so a stray trigger pull can't lose an instance
+func _on_delete_pressed(button: Button, instance_name: String) -> void:
+	if _busy:
+		return
+	if button.has_meta("confirm"):
+		_plugin.deleteInstance(instance_name)
+		return
+	button.set_meta("confirm", true)
+	button.text = "Sure?"
+	button.add_theme_color_override("font_color", TEXT)
+	button.add_theme_stylebox_override("normal", _box(BAD.darkened(0.3), 14, 12))
+	button.add_theme_stylebox_override("hover", _box(BAD.darkened(0.15), 14, 12))
+	await get_tree().create_timer(4.0).timeout
+	if is_instance_valid(button):
+		button.remove_meta("confirm")
+		button.text = "Delete"
+		button.add_theme_color_override("font_color", MUTED)
+		button.add_theme_stylebox_override("normal", _box(Color(0, 0, 0, 0), 14, 12))
+		button.add_theme_stylebox_override("hover", _box(Color(BAD, 0.12), 14, 12))
 
 
 func _update_create_button() -> void:
@@ -465,6 +550,10 @@ func _on_create() -> void:
 	# Versions from the catalog get their mods from the menu once the launcher made the instance
 	if _catalog.has_version(_version):
 		_creating = _version
+	_create_screen = true
+	_launch_value = 0.0
+	_launch_detail.text = ""
+	_launch_title.text = "Creating Minecraft " + _version
 	_plugin.createInstance(_version)
 
 
@@ -479,19 +568,114 @@ func _finish_create(instance: Dictionary) -> void:
 
 
 ## Instances made here get their mods checked first, so they update with the catalog
+func _update_launch_screen(state: Dictionary) -> void:
+	# The launcher stays busy until the game exits, so not busy means the launch failed
+	if _launching and not _working and not state.busy:
+		_launching = false
+		if _message == "":
+			_message = state.status
+	# Creating is done once the launcher made the instance and the menu installed its mods
+	if _create_screen and _creating == "" and not _working and not state.busy:
+		_create_screen = false
+	_launch_screen.visible = _launching or _create_screen
+	_menu_column.visible = not _launch_screen.visible
+	if _create_screen and not _launching:
+		_update_create_screen(state)
+		return
+	if not _launching:
+		return
+	if _working:
+		_launch_bar.indeterminate = false
+		_launch_bar.value = _catalog.progress * 100.0
+		_launch_status.text = _catalog.status if _catalog.status != "" else "Checking mods…"
+	elif state.phase == "starting" and state.get("startupStep", -1) >= 0:
+		_launch_bar.indeterminate = false
+		_launch_value = maxf(_launch_value, _startup_progress(state))
+		_launch_bar.value = _launch_value * 100.0
+		_launch_status.text = state.status
+		_launch_detail.text = state.startupText
+	else:
+		# Downloads report real progress; anything else just shows activity
+		_launch_bar.indeterminate = state.phase != "downloading"
+		_launch_bar.value = state.progress
+		_launch_status.text = state.status
+		_launch_detail.text = ""
+
+
+func _update_create_screen(state: Dictionary) -> void:
+	if _working:
+		_launch_bar.indeterminate = false
+		_launch_bar.value = _catalog.progress * 100.0
+		_launch_status.text = "Installing VR mods"
+		_launch_detail.text = _catalog.status
+	else:
+		_launch_bar.indeterminate = true
+		_launch_status.text = "Installing Fabric"
+		_launch_detail.text = state.status
+
+
+## How far the game has started, 0 to 1: the step reached sets the range, and the time spent in
+## it moves the bar along, based on how long that step took last time. It stops short of the next
+## step until the game really gets there.
+func _startup_progress(state: Dictionary) -> float:
+	var expected: Array = _startup_times().get(_launch_version, DEFAULT_STARTUP_TIMES)
+	var reached: Array = state.startupTimes
+	var step: int = mini(state.startupStep, expected.size() - 1)
+	if reached.size() == expected.size():
+		_save_startup_times(reached)
+	var total := float(expected[-1])
+	if step >= expected.size() - 1 or total <= 0.0:
+		return 1.0
+	var start := float(expected[step]) / total
+	var end := float(expected[step + 1]) / total
+	var step_length := maxf(float(expected[step + 1] - expected[step]), 1.0)
+	var in_step := (float(state.startupElapsed) - float(reached[step])) / step_length
+	return start + (end - start) * clampf(in_step, 0.0, 0.95)
+
+
+func _startup_times() -> Dictionary:
+	if not FileAccess.file_exists(STARTUP_TIMES_PATH):
+		return {}
+	var times = JSON.parse_string(FileAccess.get_file_as_string(STARTUP_TIMES_PATH))
+	return times if times is Dictionary else {}
+
+
+func _save_startup_times(reached: Array) -> void:
+	var times := _startup_times()
+	if times.get(_launch_version) == reached:
+		return
+	times[_launch_version] = reached
+	var file := FileAccess.open(STARTUP_TIMES_PATH, FileAccess.WRITE)
+	if file:
+		file.store_string(JSON.stringify(times))
+
+
 func _on_play() -> void:
 	var instance: Dictionary = _instances.get(_selected, {})
 	if instance.is_empty():
 		return
 	_message = ""
+	_launching = true
+	_launch_version = str(instance.version)
+	_launch_value = 0.0
+	_launch_detail.text = ""
+	_launch_title.text = "Starting Minecraft " + _launch_version
 	var game_dir: String = instance.get("gameDir", "")
-	if game_dir != "" and _catalog.is_menu_instance(game_dir) and _catalog.has_version(instance.version):
+	if game_dir != "" and _catalog.is_menu_instance(game_dir):
 		_working = true
 		_update_play_button()
-		var error: String = await _catalog.install_mods(game_dir, instance.version)
+		# The mod list may still be loading; launching without it would skip mod updates
+		while _catalog.busy:
+			await get_tree().process_frame
+		var error := ""
+		if _catalog.has_version(instance.version):
+			error = await _catalog.install_mods(game_dir, instance.version)
+		else:
+			error = "Couldn't get the VR mods for Minecraft %s, check your connection and try again" % instance.version
 		_working = false
 		if error != "":
 			_message = error
+			_launching = false
 			return
 	_plugin.play(_selected)
 	_play_button.disabled = true

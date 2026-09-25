@@ -8,6 +8,8 @@ signal changed
 
 const CACHE_PATH := "user://vr_versions.json"
 const CACHE_SECONDS := 6 * 3600
+## Bumped when what's remembered changes shape, so older lists get checked again
+const CACHE_FORMAT := 4
 const USER_AGENT := "AirplanegoBrr/AmethystXR-Menu"
 const MODRINTH := "https://api.modrinth.com/v2/project/%s/version?loaders=%%5B%%22fabric%%22%%5D&include_changelog=false"
 const FORK := "https://github.com/QuestCraftPlusPlus/VivecraftMod/releases/download/"
@@ -32,7 +34,12 @@ const VIVECRAFT := {
 ## When a project has no build, the next id in its list is tried.
 const MODS := [
 	{"slug": "fabric-api", "ids": ["P7dR8mSH"], "required": true},
+	{"slug": "sodium", "ids": ["AANobbMI"]},
 	{"slug": "lithium", "ids": ["gvQqBUqZ"]},
+	{"slug": "ferritecore", "ids": ["uXXizFIs"]},
+	{"slug": "immediatelyfast", "ids": ["5ZwdcRci"]},
+	{"slug": "moreculling", "ids": ["51shyZVL"]},
+	{"slug": "krypton", "ids": ["fQEb0iXm"]},
 	{"slug": "modernfix", "ids": ["modernfix", "TjSm1wrD"]},
 	{"slug": "badoptimizations", "ids": ["g96Z4WVZ"]},
 	{"slug": "zfastnoise", "ids": ["OnlVIpq5"]},
@@ -48,13 +55,20 @@ var versions: Array = []
 var busy := false
 var status := ""
 var progress := 0.0
+## Size to assume for a download Modrinth doesn't give one for (Vivecraft, from GitHub)
+const SIZE_ESTIMATE := 6 * 1024 * 1024
+var _download: HTTPRequest # The mod file being downloaded, for progress
+var _download_name := ""
+var _download_size := 0 # What the total counted for it
+var _bytes_done := 0
+var _bytes_total := 0
 var _mods := {} # version -> Array of {slug, file, url}
 
 
 ## Loads the remembered versions, and checks Modrinth again when they're old
 func refresh() -> void:
 	var cache = _read_json(CACHE_PATH)
-	if cache is Dictionary and cache.get("mods") is Dictionary:
+	if cache is Dictionary and cache.get("mods") is Dictionary and cache.get("format") == CACHE_FORMAT:
 		_use(cache.mods)
 		if Time.get_unix_time_from_system() - float(cache.get("checked", 0)) < CACHE_SECONDS:
 			return
@@ -80,13 +94,15 @@ func refresh() -> void:
 				found[version].append(builds[version])
 			elif mod.get("required", false):
 				found.erase(version)
+	if complete:
+		complete = await _add_dependencies(found)
 	busy = false
 	status = ""
 	# Offline or Modrinth is down: keep what was remembered
 	if not complete:
 		changed.emit()
 		return
-	_write_json(CACHE_PATH, {"checked": Time.get_unix_time_from_system(), "mods": found})
+	_write_json(CACHE_PATH, {"format": CACHE_FORMAT, "checked": Time.get_unix_time_from_system(), "mods": found})
 	_use(found)
 
 
@@ -107,9 +123,55 @@ func _pick_builds(list: Array, slug: String, builds: Dictionary) -> void:
 			for candidate in files:
 				if candidate.get("primary", false):
 					file = candidate
+			var requires := []
+			for dependency in build.get("dependencies", []):
+				if dependency.get("dependency_type") == "required" and dependency.get("project_id") != null:
+					requires.append(dependency.project_id)
 			for version in build.get("game_versions", []):
 				if VIVECRAFT.has(version) and not builds.has(version):
-					builds[version] = {"slug": slug, "file": file.filename, "url": file.url}
+					builds[version] = {"slug": slug, "project": build.get("project_id", ""),
+							"requires": requires, "file": file.filename, "url": file.url, "size": int(file.get("size", 0))}
+
+
+## Adds the mods the chosen builds need (Fast Noise needs zconfig, for example), and their needs
+## in turn. A mod whose requirements have no build for a version is left out of that version.
+## Returns false when Modrinth couldn't be reached.
+func _add_dependencies(found: Dictionary) -> bool:
+	var builds_by_project := {} # project id -> {version -> build}
+	for version in found.keys():
+		var mods: Array = found[version]
+		var have := {}
+		for mod in mods:
+			if mod.get("project", "") != "":
+				have[mod.project] = true
+		# Mods appended here are checked too, as the loop reaches them
+		var i := 0
+		while i < mods.size():
+			var missing := false
+			for project in mods[i].get("requires", []):
+				if have.has(project):
+					continue
+				if not builds_by_project.has(project):
+					status = "Checking mod requirements…"
+					var list = await _get_json(MODRINTH % project)
+					if not list is Array:
+						return false
+					var builds := {}
+					_pick_builds(list, project, builds)
+					builds_by_project[project] = builds
+				if not builds_by_project[project].has(version):
+					missing = true
+					break
+				mods.append(builds_by_project[project][version])
+				have[project] = true
+			if missing:
+				if mods[i].slug == "fabric-api":
+					found.erase(version)
+					break
+				mods.remove_at(i)
+			else:
+				i += 1
+	return true
 
 
 func _use(mods: Dictionary) -> void:
@@ -154,18 +216,24 @@ func install_mods(game_dir: String, version: String) -> String:
 			DirAccess.remove_absolute(mods_dir.path_join(state[slug]))
 			state.erase(slug)
 
+	var missing := wanted.filter(func(mod: Dictionary) -> bool:
+		return state.get(mod.slug) != mod.file or not FileAccess.file_exists(mods_dir.path_join(mod.file)))
 	busy = true
+	progress = 0.0
+	_bytes_done = 0
+	_bytes_total = 0
+	for mod in missing:
+		_bytes_total += _size_of(mod)
 	var error := ""
-	for i in wanted.size():
-		var mod: Dictionary = wanted[i]
+	for mod in missing:
 		var target := mods_dir.path_join(mod.file)
-		if state.get(mod.slug) == mod.file and FileAccess.file_exists(target):
-			continue
-		status = "Downloading %s…" % mod.slug
-		progress = float(i) / wanted.size()
+		_download_name = mod.file.get_basename()
+		_download_size = _size_of(mod)
+		status = "Downloading %s…" % _download_name
 		# Fabric only loads .jar files, so a half-finished download is never picked up
 		var partial := target + ".part"
 		var result: Array = await _request(mod.url, partial)
+		_bytes_done += _download_size
 		if result[0] != HTTPRequest.RESULT_SUCCESS or result[1] != 200:
 			DirAccess.remove_absolute(partial)
 			error = "Couldn't download %s, check your connection and try again" % mod.slug
@@ -178,6 +246,24 @@ func install_mods(game_dir: String, version: String) -> String:
 	busy = false
 	status = ""
 	return error
+
+
+func _size_of(mod: Dictionary) -> int:
+	return int(mod.get("size", 0)) if int(mod.get("size", 0)) > 0 else SIZE_ESTIMATE
+
+
+## Follows the download in progress by bytes, across all the files being installed
+func _process(_delta: float) -> void:
+	if _download == null or _bytes_total <= 0:
+		return
+	var size := _download.get_body_size()
+	if size > 0 and size != _download_size:
+		# Now that the server says how big it is, count that instead of the guess
+		_bytes_total += size - _download_size
+		_download_size = size
+	var got := _download.get_downloaded_bytes()
+	progress = clampf(float(_bytes_done + got) / _bytes_total, 0.0, 1.0)
+	status = "Downloading %s (%.1f / %.1f MB)" % [_download_name, got / 1048576.0, _download_size / 1048576.0]
 
 
 func _get_json(url: String) -> Variant:
@@ -194,8 +280,12 @@ func _request(url: String, download_to := "") -> Array:
 	http.timeout = 120.0
 	add_child(http)
 	var result: Array = [HTTPRequest.RESULT_CANT_CONNECT, 0, PackedStringArray(), PackedByteArray()]
+	if download_to != "":
+		_download = http
 	if http.request(url, ["User-Agent: " + USER_AGENT]) == OK:
 		result = await http.request_completed
+	if _download == http:
+		_download = null
 	http.queue_free()
 	return result
 
