@@ -25,3 +25,5 @@ addons/amlib/bin/
 android/build/build/
 android/build/.gradle/
 android/build/libs/
+# Written by every export
+android/build/src/main/assets/
